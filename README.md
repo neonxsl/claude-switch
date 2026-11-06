@@ -18,9 +18,11 @@ claude-switch <n|name>     activate a profile
 claude-switch add          add a profile (prompts; token input hidden)
 claude-switch rm <n|name>  remove a profile
 claude-switch budget <n|name> <usd>   set a profile's budget
+claude-switch test [n|name]   send one real request; shows OK or the exact API error
+claude-switch --version
 ```
 
-Activating a profile sets `env.ANTHROPIC_BASE_URL` and `apiKeyHelper` in `~/.claude/settings.json` (a timestamped backup is written first). Restart Claude Code to apply.
+Activating a profile sets `env.ANTHROPIC_BASE_URL` and `apiKeyHelper` in `~/.claude/settings.json` (a timestamped backup is written first). For Snowflake endpoints it also appends `/api/v2/cortex` to the base URL if missing and sets `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` (Cortex rejects Claude Code's beta headers otherwise). Restart Claude Code to apply.
 
 ## Storage
 
