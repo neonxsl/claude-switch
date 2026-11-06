@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Switch Claude Code between saved endpoint/token profiles.
+
+  claude-switch              list profiles with total spend (* = active)
+  claude-switch <n|name>     activate a profile
+  claude-switch add          add a profile (prompts; token input hidden)
+  claude-switch rm <n|name>  remove a profile
+  claude-switch budget <n|name> <usd>   set a profile's budget
+
+Profiles live in ~/.claude/profiles.json (chmod 600). Each profile has a
+name, base_url, optional budget (USD, default 400), and either a token
+(stored in ~/.claude/tokens/<name>) or a token_file pointing at a file.
+"""
+import getpass
+import json
+import os
+import re
+import shutil
+import sys
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from urllib.parse import urlparse
+
+CLAUDE = Path.home() / ".claude"
+SETTINGS = CLAUDE / "settings.json"
+PROFILES = CLAUDE / "profiles.json"
+TOKENS = CLAUDE / "tokens"
+DEFAULT_BUDGET = 400
+SPEND_SQL = (
+    "select coalesce(sum(usage_in_currency),0) "
+    "from snowflake.organization_usage.usage_in_currency_daily"
+)
+
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def c(rgb, text, bold=False):
+    if not USE_COLOR:
+        return text
+    return f"\033[{'1;' if bold else ''}38;2;{rgb}m{text}\033[0m"
+
+
+def dim(text):
+    return f"\033[2m{text}\033[0m" if USE_COLOR else text
+
+
+RED, AMBER, GREEN, PEACH, BLUE, GREY = (
+    "238;125;118", "255;191;71", "135;205;140", "255;190;145", "152;185;228", "150;150;150",
+)
+
+
+def load(path, default):
+    return json.loads(path.read_text()) if path.exists() else default
+
+
+def save(path, data, private=False):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    if private:
+        os.chmod(tmp, 0o600)
+    tmp.replace(path)
+
+
+def token_path(p):
+    return Path(os.path.expanduser(p["token_file"])) if p.get("token_file") else TOKENS / p["name"]
+
+
+def find(profiles, key):
+    if key.isdigit() and 1 <= int(key) <= len(profiles):
+        return int(key) - 1
+    for i, p in enumerate(profiles):
+        if p["name"] == key:
+            return i
+    sys.exit(f"no profile '{key}' — run claude-switch to list")
+
+
+def active_name(profiles):
+    settings = load(SETTINGS, {})
+    url = settings.get("env", {}).get("ANTHROPIC_BASE_URL")
+    helper = os.path.expandvars(settings.get("apiKeyHelper", ""))
+    for p in profiles:
+        if url == p["base_url"] and str(token_path(p)) in helper:
+            return p["name"]
+
+
+def fetch_spend(p):
+    """Total spend in USD, or an error string."""
+    host = urlparse(p["base_url"]).hostname or ""
+    if not host.endswith("snowflakecomputing.com"):
+        return "n/a"
+    try:
+        token = token_path(p).read_text().strip()
+
+        def run(statement, warehouse=None):
+            body = {"statement": statement, "timeout": 20}
+            if warehouse:
+                body["warehouse"] = warehouse
+            req = urllib.request.Request(
+                f"https://{host}/api/v2/statements",
+                data=json.dumps(body).encode(),
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=25) as r:
+                return json.load(r)["data"]
+
+        try:
+            return float(run(SPEND_SQL, p.get("warehouse"))[0][0])
+        except urllib.error.HTTPError as e:
+            msg = e.read().decode(errors="ignore")
+            if "specify the warehouse" not in msg:
+                raise urllib.error.HTTPError(e.url, e.code, msg, e.headers, None) from e
+            # No default warehouse for this user: pick the first one and remember it.
+            warehouses = run("show warehouses")
+            if not warehouses:
+                return "no warehouse"
+            p["warehouse"] = warehouses[0][0]
+            return float(run(SPEND_SQL, p["warehouse"])[0][0])
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return "auth failed"
+        msg = e.msg if isinstance(e.msg, str) else ""
+        if "not authorized" in msg:
+            role = re.search(r"primary role (\w+)", msg)
+            return "no billing access" + (f" (role {role.group(1)})" if role else "")
+        return f"HTTP {e.code}"
+    except Exception:
+        return "unreachable"
+
+
+def bar(frac, width=20):
+    filled = min(width, round(frac * width))
+    col = RED if frac >= 0.9 else AMBER if frac >= 0.75 else GREEN
+    return c(col, "█" * filled) + dim("░" * (width - filled)), col
+
+
+def cmd_list(profiles):
+    if not profiles:
+        print("no profiles yet — run: claude-switch add")
+        return
+    current = active_name(profiles)
+    if USE_COLOR:
+        print(dim("fetching spend…"), end="\r", flush=True)
+    before = json.dumps(profiles)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        spends = list(pool.map(fetch_spend, profiles))
+    if json.dumps(profiles) != before:  # a warehouse was auto-detected
+        save(PROFILES, profiles, private=True)
+    if USE_COLOR:
+        print("\033[2K", end="")
+
+    width = max(len(p["name"]) for p in profiles)
+    print(c(PEACH, "Claude endpoints", bold=True) + dim("  · total spend"))
+    print()
+    for i, (p, spend) in enumerate(zip(profiles, spends), 1):
+        is_active = p["name"] == current
+        mark = c(GREEN, "●", bold=True) if is_active else dim("○")
+        num = c(BLUE, f"{i}.", bold=True)
+        name = c(PEACH if is_active else "230;230;230", p["name"].ljust(width), bold=is_active)
+        if isinstance(spend, float):
+            usage = usage_line(spend, p.get("budget", DEFAULT_BUDGET))
+        else:
+            usage = c(GREY if spend == "n/a" else RED, spend)
+        print(f" {mark} {num} {name}  {usage}")
+        print(f"      {dim(urlparse(p['base_url']).hostname or p['base_url'])}"
+              + (c(GREEN, "  active") if is_active else ""))
+
+    known = [(p, s) for p, s in zip(profiles, spends) if isinstance(s, float)]
+    if len(known) > 1:
+        total = sum(s for _, s in known)
+        total_budget = sum(p.get("budget", DEFAULT_BUDGET) for p, _ in known)
+        label = c(PEACH, "total".ljust(width), bold=True)
+        print(dim("   " + "─" * (width + 60)))
+        print(f"      {label}  {usage_line(total, total_budget)}")
+        skipped = len(profiles) - len(known)
+        if skipped:
+            print(dim(f"      excludes {skipped} account{'s' * (skipped > 1)} without spend data"))
+    print()
+    print(dim("switch: claude-switch <n>   add: claude-switch add"))
+
+
+def usage_line(spend, budget):
+    b, col = bar(spend / budget if budget else 0)
+    left = budget - spend
+    return f"{b}  {c(col, f'${spend:,.2f}', bold=True)}{dim(f' / ${budget:,.0f}')}  " + (
+        dim(f"${left:,.2f} left") if left >= 0 else c(RED, f"${-left:,.2f} over")
+    )
+
+
+def cmd_add(profiles):
+    name = input("name: ").strip()
+    if not re.fullmatch(r"[\w.-]+", name) or any(p["name"] == name for p in profiles):
+        sys.exit("invalid or duplicate name")
+    url = input("base url: ").strip()
+    tok = getpass.getpass("token (or @/path/to/file): ").strip()
+    budget = input(f"budget USD [{DEFAULT_BUDGET}]: ").strip()
+    p = {"name": name, "base_url": url, "budget": float(budget) if budget else DEFAULT_BUDGET}
+    if tok.startswith("@"):
+        p["token_file"] = tok[1:]
+    else:
+        TOKENS.mkdir(mode=0o700, exist_ok=True)
+        path = TOKENS / name
+        path.write_text(tok)
+        os.chmod(path, 0o600)
+    profiles.append(p)
+    save(PROFILES, profiles, private=True)
+    print(c(GREEN, f"added {len(profiles)}. {name}"))
+
+
+def cmd_rm(profiles, key):
+    p = profiles.pop(find(profiles, key))
+    if not p.get("token_file"):
+        (TOKENS / p["name"]).unlink(missing_ok=True)
+    save(PROFILES, profiles, private=True)
+    print(c(AMBER, f"removed {p['name']}"))
+
+
+def cmd_budget(profiles, key, amount):
+    p = profiles[find(profiles, key)]
+    p["budget"] = float(amount)
+    save(PROFILES, profiles, private=True)
+    print(c(GREEN, f"{p['name']} budget set to ${p['budget']:,.0f}"))
+
+
+def cmd_use(profiles, key):
+    p = profiles[find(profiles, key)]
+    if not token_path(p).exists():
+        sys.exit(f"token file missing: {token_path(p)}")
+    settings = load(SETTINGS, {})
+    CLAUDE.mkdir(exist_ok=True)
+    if SETTINGS.exists():
+        shutil.copy2(SETTINGS, CLAUDE / f"settings.json.switch-{time.strftime('%Y%m%d-%H%M%S')}")
+    settings.setdefault("env", {})["ANTHROPIC_BASE_URL"] = p["base_url"]
+    settings["apiKeyHelper"] = f"cat {token_path(p)}"
+    save(SETTINGS, settings)
+    print(f"{c(GREEN, '✓', bold=True)} switched to {c(PEACH, p['name'], bold=True)} "
+          f"{dim('(' + p['base_url'] + ')')}")
+    print(dim("  restart claude to apply"))
+
+
+def main():
+    profiles = load(PROFILES, [])
+    args = sys.argv[1:]
+    if not args:
+        cmd_list(profiles)
+    elif args[0] == "add":
+        cmd_add(profiles)
+    elif args[0] in ("rm", "remove") and len(args) == 2:
+        cmd_rm(profiles, args[1])
+    elif args[0] == "budget" and len(args) == 3:
+        cmd_budget(profiles, args[1], args[2])
+    elif args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+    else:
+        cmd_use(profiles, args[0])
+
+
+if __name__ == "__main__":
+    main()
