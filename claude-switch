@@ -118,7 +118,9 @@ def fetch_spend(p):
         tp = token_path(p)
         if not tp.exists():
             return f"token file missing: {tp}"
-        token = tp.read_text().strip()
+        token = tp.read_text().strip().strip('"\'')
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
         if not token:
             return f"token file empty: {tp}"
 
@@ -152,9 +154,14 @@ def fetch_spend(p):
             p["warehouse"] = warehouses[0][0]
             return float(run(SPEND_SQL, p["warehouse"])[0][0])
     except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            return "auth failed"
         msg = e.msg if isinstance(e.msg, str) else ""
+        if e.code in (401, 403):
+            try:
+                detail = json.loads(msg).get("message", "")
+            except ValueError:
+                detail = msg
+            detail = " ".join(detail.split())[:160]
+            return f"auth failed (HTTP {e.code}{': ' + detail if detail else ''})"
         if "not authorized" in msg:
             role = re.search(r"primary role (\w+)", msg)
             return "no billing access" + (f" (role {role.group(1)})" if role else "")
