@@ -29,6 +29,7 @@ CLAUDE = Path.home() / ".claude"
 SETTINGS = CLAUDE / "settings.json"
 PROFILES = CLAUDE / "profiles.json"
 TOKENS = CLAUDE / "tokens"
+VERSION = "1.3"
 DEFAULT_BUDGET = 400
 SPEND_SQL = (
     "select coalesce(sum(usage_in_currency),0) "
@@ -296,6 +297,8 @@ def main():
         cmd_rm(profiles, args[1])
     elif args[0] == "budget" and len(args) == 3:
         cmd_budget(profiles, args[1], args[2])
+    elif args[0] in ("-V", "--version", "version"):
+        print(f"claude-switch {VERSION} ({Path(__file__).resolve()})")
     elif args[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
     else:
