@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import sys
 import time
 import urllib.error
@@ -87,13 +88,39 @@ def active_name(profiles):
             return p["name"]
 
 
+def ssl_context():
+    """Default context, falling back to certifi or macOS system roots when
+    Python has no CA bundle (common with python.org installers)."""
+    ctx = ssl.create_default_context()
+    if ctx.get_ca_certs():
+        return ctx
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        pass
+    for path in ("/etc/ssl/cert.pem", "/opt/homebrew/etc/ca-certificates/cert.pem",
+                 "/usr/local/etc/ca-certificates/cert.pem"):
+        if os.path.exists(path):
+            return ssl.create_default_context(cafile=path)
+    return ctx
+
+
+SSL_CTX = ssl_context()
+
+
 def fetch_spend(p):
     """Total spend in USD, or an error string."""
     host = urlparse(p["base_url"]).hostname or ""
     if not host.endswith("snowflakecomputing.com"):
         return "n/a"
     try:
-        token = token_path(p).read_text().strip()
+        tp = token_path(p)
+        if not tp.exists():
+            return f"token file missing: {tp}"
+        token = tp.read_text().strip()
+        if not token:
+            return f"token file empty: {tp}"
 
         def run(statement, warehouse=None):
             body = {"statement": statement, "timeout": 20}
@@ -109,7 +136,7 @@ def fetch_spend(p):
                     "Accept": "application/json",
                 },
             )
-            with urllib.request.urlopen(req, timeout=25) as r:
+            with urllib.request.urlopen(req, timeout=25, context=SSL_CTX) as r:
                 return json.load(r)["data"]
 
         try:
@@ -132,8 +159,13 @@ def fetch_spend(p):
             role = re.search(r"primary role (\w+)", msg)
             return "no billing access" + (f" (role {role.group(1)})" if role else "")
         return f"HTTP {e.code}"
-    except Exception:
-        return "unreachable"
+    except urllib.error.URLError as e:
+        reason = e.reason
+        if isinstance(reason, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(reason):
+            return "SSL cert error — run: pip3 install certifi (or Python's Install Certificates.command)"
+        return f"unreachable ({reason})"
+    except Exception as e:
+        return f"error: {type(e).__name__}: {e}"
 
 
 def bar(frac, width=20):
